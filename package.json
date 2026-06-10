@@ -65,6 +65,15 @@
     "typescript"
   ],
   "license": "MIT",
+  "author": "VDHewei@github.io",
+  "packageManager": "pnpm@10.33.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/VDHewei/image-lib.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "devDependencies": {
     "@types/bun": "latest"
   },
