@@ -5,6 +5,7 @@
  * 子命令：
  *   stamp  生成动态印章图片（支持中英文、自定义字体/字号/颜色）
  *   crop   抠图：从源图提取边框，生成中间透明的"无字底图"
+ *   gen    一键端到端：抠图 + 在抠除区域内添加文字 + 输出印章图片
  *
  * 通用 flags：
  *   -h, --help     显示帮助
@@ -14,11 +15,16 @@
  */
 import path from 'path';
 import fs from 'fs';
+import os from 'os';
 import {
   generateDynamicStamp,
   cropTransparentBackground,
   getExtForFormat,
   type EncodeFormat,
+  type EncodeOptions,
+  type GenerateStampOptions,
+  type CropOptions,
+  type Region,
 } from './main';
 
 const VERSION = '0.1.0';
@@ -85,6 +91,7 @@ USAGE:
 COMMANDS:
   stamp     生成动态印章图片（自适应文本宽度）
   crop      抠图：从源图提取边框，生成中间透明的底图
+  gen       端到端：抠图 + 在抠除区域内添加文字 + 输出印章图片（一步到位）
 
 GLOBAL OPTIONS:
   -h, --help     显示帮助
@@ -93,6 +100,7 @@ GLOBAL OPTIONS:
 EXAMPLES:
   image-lib stamp --bg images/draft.png --text "草稿" --out out/stamp.png
   image-lib crop  --src images/draft.png --out out/clean-bg.png
+  image-lib gen   --src images/draft.png --text "Approved" --out out/final.png
   image-lib stamp --help
 `);
 }
@@ -117,9 +125,18 @@ FONT:
   --font-file <path>          本地字体文件路径
   --font-family <css>         系统字体族（默认跨平台后备）
   --font-name <name>          注册到 GlobalFonts 的字体名
-  --font-size <px>            字号（默认 40）
+  --font-size <size>          字号；支持 32 / 32px / 24pt（pt→px：×96/72）
+                                不指定时跟随 textRegion.height-margin；否则默认 40px
   --font-color <#hex>         字体颜色（默认 #FF99A8）
   --no-bold                   关闭加粗
+
+SPECKLE (橡皮章/屏幕雪花斑驳效果):
+  --speckle-mode <m>          none|uniform|per-char（默认 per-char）
+  --speckle-density <0-1>     目标覆盖率（默认 0.0075 = 0.75%，推荐 0.005-0.01）
+  --speckle-size <px>         多边形基础半径（默认 1.2，实际形状是 4-7 顶点不规则多边形）
+  --speckle-color <css>       斑点颜色（默认 transparent 透明镂空；可传 #FFFFFF / #000000 等实色）
+  --speckle-seed <int>        固定随机种子（测试可复现）
+  --no-speckle                等价于 --speckle-mode none
 
 LAYOUT:
   --margin <n>                统一四边距（默认 20）
@@ -184,6 +201,78 @@ EXAMPLES:
 `);
 }
 
+function printGenHelp(): void {
+  console.log(`image-lib gen  端到端：抠图 → 在抠除区域内添加文字 → 输出印章图片
+
+USAGE:
+  image-lib gen --src <path> --text <string> [options]
+
+PIPELINE:
+  1. cropTransparentBackground(--src)  得到 region + 透明底图
+  2. generateDynamicStamp(底图, text, textRegion=region)  落字
+  3. 写入 --out（最终印章）
+
+REQUIRED:
+  --src, --source <path>      源图路径（如 images/draft.png）
+  --text <string>             印章文字（1-255 字）
+
+OUTPUT:
+  --out, --output <path>      最终输出路径（默认 out/gen-stamp.<ext>）
+  --intermediate <path>       同时把抠图中间产物落盘到此路径（不指定则用临时文件并清理）
+  --keep-intermediate         保留自动生成的临时中间产物（不和 --intermediate 同时使用）
+  --format <fmt>              输出格式 png|jpeg|webp|avif|gif（默认 png）
+  --quality <0-100>           jpeg/webp/gif 质量
+
+CROP FLAGS (透传给 crop 步骤):
+  --keep <outside|inside>     保留框外/框内（默认 outside）
+  --target-color <r,g,b>      框选颜色（默认 255,215,0 黄色）
+  --target-tolerance <n>      框选容差（默认 80）
+  --transparent-color <r,g,b> 额外透明化颜色（outside 模式默认不启用；inside 模式默认白色）
+  --transparent-tolerance <n> 透明容差（默认 40）
+  --no-transparent            显式关闭颜色透明化
+  --padding <px>              outside 内缩 / inside 外扩（默认 0）
+
+FONT (与 stamp 完全一致；gen 专属默认：family=sans-serif，size=24pt32px):
+  --font-url <url>            远程字体 URL（优先级最高）
+  --font-file <path>          本地字体文件路径
+  --font-family <css>         系统字体族（gen 默认 sans-serif）
+  --font-name <name>          注册到 GlobalFonts 的字体名
+  --font-size <size>          字号；支持 32 / 32px / 24pt（pt→px：×96/72）
+                                gen 默认 24pt = 32px；指定后覆盖 region 自动推断
+  --font-color <#hex>         字体颜色（默认 #FF99A8）
+  --no-bold                   关闭加粗
+
+OTHER STAMP FLAGS (透传；textRegion 自动取 crop 返回的 region):
+  --margin* / --speckle-* / --no-speckle / --no-stretch / --overflow
+  详见 'image-lib stamp --help'
+
+EXAMPLES:
+  # 最简单：用 images/draft.png 的黄框抠出来，在洞里写 "Approved"
+  # 默认字体：sans-serif，24pt = 32px
+  image-lib gen --src images/draft.png --text "Approved" --out out/approved.png
+
+  # 同时保留中间抠图产物便于检查
+  image-lib gen --src images/draft.png --text "草稿" \\
+    --out out/zh.png --intermediate out/zh-crop.png
+
+  # 显式指定字号（支持 pt / px）
+  image-lib gen --src images/draft.png --text "DRAFT" --out out/draft.png \\
+    --font-size 30pt --font-color "#FF0000"
+
+  # 自定义系统字体族
+  image-lib gen --src images/draft.png --text "Confidential" --out out/cf.png \\
+    --font-family 'Georgia, "Times New Roman", serif'
+
+  # 自定义字体 + 关闭斑驳 + jpeg 输出
+  image-lib gen --src images/draft.png --text "DRAFT" --out out/draft.jpg \\
+    --format jpeg --quality 90 --font-color "#FF0000" --no-speckle
+
+  # 复现实验：固定 seed
+  image-lib gen --src images/draft.png --text "Pending" \\
+    --out out/pending.png --speckle-seed 42
+`);
+}
+
 /** 解析 "r,g,b" 字符串为 RGB 对象 */
 function parseRGB(str: string, name: string): { r: number; g: number; b: number } {
   const parts = str.split(',').map(s => Number(s.trim()));
@@ -202,6 +291,30 @@ function parseRegion(str: string, name: string): { x: number; y: number; width: 
   return { x: parts[0]!, y: parts[1]!, width: parts[2]!, height: parts[3]! };
 }
 
+/**
+ * 解析字号字符串，支持 px 与 pt 单位
+ *
+ *   "40"     → 40    (无单位默认 px)
+ *   "40px"   → 40
+ *   "24pt"   → 32    (24 × 96/72 = 32)
+ *   "24.5pt" → 33    (四舍五入到整数像素)
+ *
+ * pt → px 换算：1pt = 1/72 inch，Canvas/浏览器使用 96 DPI，故 1pt = 96/72 = 4/3 px
+ */
+function parseFontSize(input: string, name: string): number {
+  const trimmed = input.trim().toLowerCase();
+  const m = /^(\d+(?:\.\d+)?)(px|pt)?$/.exec(trimmed);
+  if (!m) {
+    throw new Error(`--${name} 格式无效："${input}"，支持示例：32 / 32px / 24pt`);
+  }
+  const value = Number(m[1]);
+  const unit = m[2] ?? 'px';
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error(`--${name} 必须是正数，实际 "${input}"`);
+  }
+  return unit === 'pt' ? Math.round(value * 96 / 72) : value;
+}
+
 function parseMargin(p: ParsedArgs): { top: number; right: number; bottom: number; left: number } {
   const uniform = pickFlag(p, 'margin');
   const def = uniform !== undefined ? Number(uniform) : 20;
@@ -213,28 +326,27 @@ function parseMargin(p: ParsedArgs): { top: number; right: number; bottom: numbe
   };
 }
 
-async function runStamp(p: ParsedArgs): Promise<void> {
-  if (pickBool(p, 'h', 'help')) { printStampHelp(); return; }
-
-  const bg = pickFlag(p, 'bg', 'background');
-  const text = pickFlag(p, 'text');
-  if (!bg) throw new Error('缺少必填参数 --bg <path>');
-  if (!text) throw new Error('缺少必填参数 --text <string>');
-  if (text.length < 1 || text.length > 255) throw new Error(`--text 长度需在 1-255 之间，实际 ${text.length}`);
-  if (!fs.existsSync(bg)) throw new Error(`背景图不存在: ${bg}`);
-
-  const format = (pickFlag(p, 'format') ?? 'png') as EncodeFormat;
-  const out = pickFlag(p, 'out', 'output') ?? path.join('out', `stamp${getExtForFormat(format)}`);
-  const qualityStr = pickFlag(p, 'quality');
-  const encodeOptions = qualityStr !== undefined
-    ? { format, quality: Number(qualityStr) }
-    : format;
-
-  const fontSizeStr = pickFlag(p, 'font-size');
-
+/**
+ * 从 ParsedArgs 构造 generateDynamicStamp 的完整 options
+ *
+ * @param bg                    背景图路径（必填，由调用方显式传入）
+ * @param text                  印章文字（必填，由调用方显式传入）
+ * @param encodeOptions         编码配置（已在调用方根据 --format / --quality 组装）
+ * @param overrideTextRegion    若提供，则覆盖 --text-region flag（gen 子命令用 crop 返回的 region）
+ *
+ * 注：此函数只解析 stamp 相关 flag，不读取 --bg / --text / --out / --format / --quality
+ */
+function buildStampOptions(
+  p: ParsedArgs,
+  bg: string,
+  text: string,
+  encodeOptions: EncodeFormat | EncodeOptions,
+  overrideTextRegion?: Region,
+): GenerateStampOptions {
   // —— textRegion / 拉伸策略 ——
   const textRegionStr = pickFlag(p, 'text-region');
-  const textRegion = textRegionStr !== undefined ? parseRegion(textRegionStr, 'text-region') : undefined;
+  const textRegion = overrideTextRegion
+    ?? (textRegionStr !== undefined ? parseRegion(textRegionStr, 'text-region') : undefined);
   const noStretch = pickBool(p, 'no-stretch');
   const overflowRaw = pickFlag(p, 'overflow');
   if (overflowRaw !== undefined && !['shrink', 'clip', 'overflow'].includes(overflowRaw)) {
@@ -242,14 +354,32 @@ async function runStamp(p: ParsedArgs): Promise<void> {
   }
   const overflowStrategy = overflowRaw as ('shrink' | 'clip' | 'overflow' | undefined);
 
-  const buffer = await generateDynamicStamp({
+  // —— 斑驳效果 ——
+  const noSpeckle = pickBool(p, 'no-speckle');
+  const speckleModeRaw = pickFlag(p, 'speckle-mode');
+  if (speckleModeRaw !== undefined && !['none', 'uniform', 'per-char'].includes(speckleModeRaw)) {
+    throw new Error(`--speckle-mode 必须是 'none'|'uniform'|'per-char'，实际 "${speckleModeRaw}"`);
+  }
+  const speckleMode = noSpeckle
+    ? 'none' as const
+    : (speckleModeRaw as ('none' | 'uniform' | 'per-char' | undefined));
+  const speckleDensityStr = pickFlag(p, 'speckle-density');
+  const speckleSizeStr = pickFlag(p, 'speckle-size');
+  const speckleColor = pickFlag(p, 'speckle-color');
+  const speckleSeedStr = pickFlag(p, 'speckle-seed');
+
+  // —— 字体 ——
+  const fontSizeStr = pickFlag(p, 'font-size');
+  const fontSize = fontSizeStr !== undefined ? parseFontSize(fontSizeStr, 'font-size') : undefined;
+
+  return {
     backgroundPath: bg,
     text,
     fontURL: pickFlag(p, 'font-url'),
     fontFilePath: pickFlag(p, 'font-file'),
     fontFamily: pickFlag(p, 'font-family'),
     fontName: pickFlag(p, 'font-name'),
-    fontSize: fontSizeStr !== undefined ? Number(fontSizeStr) : undefined,
+    fontSize,
     fontColor: pickFlag(p, 'font-color'),
     fontBold: !pickBool(p, 'no-bold'),
     margin: parseMargin(p),
@@ -257,29 +387,29 @@ async function runStamp(p: ParsedArgs): Promise<void> {
     textRegion,
     stretchTextRegion: textRegion ? !noStretch : undefined,
     overflowStrategy,
-  });
-
-  fs.mkdirSync(path.dirname(path.resolve(out)), { recursive: true });
-  fs.writeFileSync(out, buffer);
-  const regionInfo = textRegion ? ` region=${textRegion.x},${textRegion.y},${textRegion.width}x${textRegion.height} stretch=${!noStretch}` : '';
-  console.log(`已生成印章: ${path.resolve(out)} (${buffer.length} bytes)${regionInfo}`);
+    speckleMode,
+    speckleDensity: speckleDensityStr !== undefined ? Number(speckleDensityStr) : undefined,
+    speckleSize: speckleSizeStr !== undefined ? Number(speckleSizeStr) : undefined,
+    speckleColor,
+    speckleSeed: speckleSeedStr !== undefined ? Number(speckleSeedStr) : undefined,
+  };
 }
 
-async function runCrop(p: ParsedArgs): Promise<void> {
-  if (pickBool(p, 'h', 'help')) { printCropHelp(); return; }
-
-  const src = pickFlag(p, 'src', 'source');
-  if (!src) throw new Error('缺少必填参数 --src <path>');
-  if (!fs.existsSync(src)) throw new Error(`源图不存在: ${src}`);
-
-  const format = (pickFlag(p, 'format') ?? 'png') as EncodeFormat;
-  const out = pickFlag(p, 'out', 'output') ?? path.join('out', `clean-bg${getExtForFormat(format)}`);
-
-  const qualityStr = pickFlag(p, 'quality');
-  const encodeOptions = qualityStr !== undefined
-    ? { format, quality: Number(qualityStr) }
-    : format;
-
+/**
+ * 从 ParsedArgs 构造 cropTransparentBackground 的完整 options
+ *
+ * @param src               源图路径（必填，由调用方显式传入）
+ * @param outputPath        输出路径（可选；undefined 时 crop 只返回 buffer 不落盘）
+ * @param encodeOptions     编码配置
+ *
+ * 注：此函数只解析 crop 相关 flag，不读取 --src / --out / --format / --quality
+ */
+function buildCropOptions(
+  p: ParsedArgs,
+  src: string,
+  outputPath: string | undefined,
+  encodeOptions: EncodeFormat | EncodeOptions,
+): CropOptions {
   // —— 保留区域模式 ——
   const keepRaw = pickFlag(p, 'keep');
   if (keepRaw !== undefined && keepRaw !== 'inside' && keepRaw !== 'outside') {
@@ -299,9 +429,9 @@ async function runCrop(p: ParsedArgs): Promise<void> {
     ? null
     : (transparentColorStr !== undefined ? parseRGB(transparentColorStr, 'transparent-color') : undefined);
 
-  const result = await cropTransparentBackground({
+  return {
     sourceImgPath: src,
-    outputPath: out,
+    outputPath,
     keepRegion,
     targetColor: targetColorStr !== undefined ? parseRGB(targetColorStr, 'target-color') : undefined,
     targetTolerance: targetToleranceStr !== undefined ? Number(targetToleranceStr) : undefined,
@@ -309,13 +439,148 @@ async function runCrop(p: ParsedArgs): Promise<void> {
     transparentTolerance: transparentToleranceStr !== undefined ? Number(transparentToleranceStr) : undefined,
     padding: paddingStr !== undefined ? Number(paddingStr) : undefined,
     encodeOptions,
-  });
+  };
+}
+
+async function runStamp(p: ParsedArgs): Promise<void> {
+  if (pickBool(p, 'h', 'help')) { printStampHelp(); return; }
+
+  const bg = pickFlag(p, 'bg', 'background');
+  const text = pickFlag(p, 'text');
+  if (!bg) throw new Error('缺少必填参数 --bg <path>');
+  if (!text) throw new Error('缺少必填参数 --text <string>');
+  if (text.length < 1 || text.length > 255) throw new Error(`--text 长度需在 1-255 之间，实际 ${text.length}`);
+  if (!fs.existsSync(bg)) throw new Error(`背景图不存在: ${bg}`);
+
+  const format = (pickFlag(p, 'format') ?? 'png') as EncodeFormat;
+  const out = pickFlag(p, 'out', 'output') ?? path.join('out', `stamp${getExtForFormat(format)}`);
+  const qualityStr = pickFlag(p, 'quality');
+  const encodeOptions: EncodeFormat | EncodeOptions = qualityStr !== undefined
+    ? { format, quality: Number(qualityStr) }
+    : format;
+
+  const stampOpts = buildStampOptions(p, bg, text, encodeOptions);
+  const buffer = await generateDynamicStamp(stampOpts);
+
+  fs.mkdirSync(path.dirname(path.resolve(out)), { recursive: true });
+  fs.writeFileSync(out, buffer);
+  const tr = stampOpts.textRegion;
+  const regionInfo = tr ? ` region=${tr.x},${tr.y},${tr.width}x${tr.height} stretch=${stampOpts.stretchTextRegion ?? true}` : '';
+  const speckleInfo = stampOpts.speckleMode === 'none' ? ' speckle=off' : ` speckle=${stampOpts.speckleMode ?? 'per-char'}`;
+  console.log(`已生成印章: ${path.resolve(out)} (${buffer.length} bytes)${regionInfo}${speckleInfo}`);
+}
+
+async function runCrop(p: ParsedArgs): Promise<void> {
+  if (pickBool(p, 'h', 'help')) { printCropHelp(); return; }
+
+  const src = pickFlag(p, 'src', 'source');
+  if (!src) throw new Error('缺少必填参数 --src <path>');
+  if (!fs.existsSync(src)) throw new Error(`源图不存在: ${src}`);
+
+  const format = (pickFlag(p, 'format') ?? 'png') as EncodeFormat;
+  const out = pickFlag(p, 'out', 'output') ?? path.join('out', `clean-bg${getExtForFormat(format)}`);
+
+  const qualityStr = pickFlag(p, 'quality');
+  const encodeOptions: EncodeFormat | EncodeOptions = qualityStr !== undefined
+    ? { format, quality: Number(qualityStr) }
+    : format;
+
+  const cropOpts = buildCropOptions(p, src, out, encodeOptions);
+  const result = await cropTransparentBackground(cropOpts);
 
   const r = result.region;
-  console.log(`已生成底图: ${path.resolve(out)} (${result.buffer.length} bytes, keep=${keepRegion ?? 'outside'})`);
+  console.log(`已生成底图: ${path.resolve(out)} (${result.buffer.length} bytes, keep=${cropOpts.keepRegion ?? 'outside'})`);
   console.log(`  画布: ${result.width}x${result.height}`);
   console.log(`  region: x=${r.x} y=${r.y} w=${r.width} h=${r.height}`);
   console.log(`  作为 stamp --text-region 参数: "${r.x},${r.y},${r.width},${r.height}"`);
+}
+
+/**
+ * gen 子命令：端到端流水线
+ *   crop(src)  buffer + region  写入临时/指定中间文件
+ *    stamp(中间文件, text, textRegion=region)  写入 --out
+ *
+ * 中间文件策略：
+ *   - 用户传 --intermediate <path>：落到该路径并保留
+ *   - 用户传 --keep-intermediate（无路径）：在 out 目录生成 gen-crop-<rand>.png 并保留
+ *   - 默认：os.tmpdir() 下生成临时 PNG，stamp 结束后立即删除
+ */
+async function runGen(p: ParsedArgs): Promise<void> {
+  if (pickBool(p, 'h', 'help')) { printGenHelp(); return; }
+
+  const src = pickFlag(p, 'src', 'source');
+  const text = pickFlag(p, 'text');
+  if (!src) throw new Error('缺少必填参数 --src <path>');
+  if (!text) throw new Error('缺少必填参数 --text <string>');
+  if (text.length < 1 || text.length > 255) throw new Error(`--text 长度需在 1-255 之间，实际 ${text.length}`);
+  if (!fs.existsSync(src)) throw new Error(`源图不存在: ${src}`);
+
+  const format = (pickFlag(p, 'format') ?? 'png') as EncodeFormat;
+  const out = pickFlag(p, 'out', 'output') ?? path.join('out', `gen-stamp${getExtForFormat(format)}`);
+  const qualityStr = pickFlag(p, 'quality');
+  const encodeOptions: EncodeFormat | EncodeOptions = qualityStr !== undefined
+    ? { format, quality: Number(qualityStr) }
+    : format;
+
+  // 决定中间文件路径与是否保留
+  const intermediateFlag = pickFlag(p, 'intermediate');
+  const keepIntermediate = pickBool(p, 'keep-intermediate');
+  let intermediatePath: string;
+  let shouldKeepIntermediate: boolean;
+  if (intermediateFlag !== undefined) {
+    intermediatePath = intermediateFlag;
+    shouldKeepIntermediate = true;
+  } else if (keepIntermediate) {
+    intermediatePath = path.join('out', `gen-crop-${Date.now()}.png`);
+    shouldKeepIntermediate = true;
+  } else {
+    // 临时文件：放在系统 tmp，确保 stamp 读取后能立即清理
+    intermediatePath = path.join(os.tmpdir(), `image-lib-gen-${process.pid}-${Date.now()}.png`);
+    shouldKeepIntermediate = false;
+  }
+
+  // ——  1. 抠图 ——
+  // 中间产物固定用 PNG（保留透明度，避免 jpeg 把抠透区域填白）
+  const cropOpts = buildCropOptions(p, src, intermediatePath, 'png');
+  const cropResult = await cropTransparentBackground(cropOpts);
+  const r = cropResult.region;
+
+  // ——  2. 印章（textRegion 直接复用 crop 返回的 region） ——
+  const stampOpts = buildStampOptions(p, intermediatePath, text, encodeOptions, r);
+
+  // —— gen 专属默认字体（仅在用户未显式指定时生效） ——
+  // - fontFamily 默认 'sans-serif'，但若用户用 --font-url / --font-file / --font-name
+  //   提供了其它字体源，则不覆盖（保留 loadFont 优先级语义）
+  // - fontSize 默认 24pt = 32px（96 DPI 下 24 × 4/3 = 32）
+  const hasFontSource = stampOpts.fontURL !== undefined
+    || stampOpts.fontFilePath !== undefined
+    || stampOpts.fontFamily !== undefined
+    || stampOpts.fontName !== undefined;
+  if (!hasFontSource) {
+    stampOpts.fontFamily = 'sans-serif';
+  }
+  if (stampOpts.fontSize === undefined) {
+    stampOpts.fontSize = Math.round(24 * 96 / 72); // 24pt → 32px
+  }
+
+  const stampBuf = await generateDynamicStamp(stampOpts);
+
+  // ——  3. 写最终输出 ——
+  fs.mkdirSync(path.dirname(path.resolve(out)), { recursive: true });
+  fs.writeFileSync(out, stampBuf);
+
+  // ——  4. 清理临时中间产物 ——
+  if (!shouldKeepIntermediate) {
+    try { fs.unlinkSync(intermediatePath); } catch { /* 忽略：失败也不影响主流程 */ }
+  }
+
+  const speckleInfo = stampOpts.speckleMode === 'none' ? ' speckle=off' : ` speckle=${stampOpts.speckleMode ?? 'per-char'}`;
+  const intInfo = shouldKeepIntermediate ? ` intermediate=${path.resolve(intermediatePath)}` : '';
+  const fontInfo = `${stampOpts.fontFamily ?? '(custom)'} ${stampOpts.fontSize}px`;
+  console.log(`已生成印章: ${path.resolve(out)} (${stampBuf.length} bytes)`);
+  console.log(`  画布: ${cropResult.width}x${cropResult.height}  keep=${cropOpts.keepRegion ?? 'outside'}`);
+  console.log(`  font: ${fontInfo}`);
+  console.log(`  textRegion: x=${r.x} y=${r.y} w=${r.width} h=${r.height}${speckleInfo}${intInfo}`);
 }
 
 async function main(): Promise<void> {
@@ -334,6 +599,7 @@ async function main(): Promise<void> {
   switch (cmd) {
     case 'stamp': return runStamp(subArgs);
     case 'crop':  return runCrop(subArgs);
+    case 'gen':   return runGen(subArgs);
     case 'help':
     case undefined: return printRootHelp();
     default:

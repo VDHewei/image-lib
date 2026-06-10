@@ -28,6 +28,7 @@ export {
   type EncodeOptions,
   type TextRegion,
   type OverflowStrategy,
+  type SpeckleMode,
 } from './create_dynamic_stamp';
 
 export {

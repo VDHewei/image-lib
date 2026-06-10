@@ -1,0 +1,22 @@
+{
+  // 仅用于构建 .d.ts 声明文件
+  // 实际 .js 由 bun build 产生（保留 sourcemap），declaration 由 tsc 产生
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "emitDeclarationOnly": true,
+    "declaration": true,
+    "declarationMap": true,
+    "outDir": "dist",
+    "rootDir": "src",
+    // 类型构建场景下不需要 allowImportingTsExtensions，关闭以避免发出带 .ts 扩展的 import
+    "allowImportingTsExtensions": false,
+    "verbatimModuleSyntax": false,
+    "isolatedModules": true,
+    // 加入 node 环境（process / Buffer / fs / __dirname 等）以及 DOM lib（fetch / URL / console）
+    "lib": ["ESNext", "DOM"],
+    "types": ["bun"]
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["src/**/*.test.ts", "src/bin.ts", "src/font_cache/**"]
+}

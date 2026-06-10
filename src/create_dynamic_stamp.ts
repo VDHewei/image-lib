@@ -27,6 +27,15 @@ export interface EncodeOptions {
  */
 export type OverflowStrategy = 'shrink' | 'clip' | 'overflow';
 
+/**
+ * 文字斑驳（白色斑点噪声）效果模式：
+ * - 'none'    ：关闭斑点（保持纯色文字）
+ * - 'uniform' ：在整个文字区域均匀随机散布白色斑点
+ * - 'per-char'：以字符列宽为单元分组随机（每个字符的斑点密度独立波动，**默认**）
+ *               更接近真实印章/橡皮章使用磨损或干油墨的视觉
+ */
+export type SpeckleMode = 'none' | 'uniform' | 'per-char';
+
 /** 文字填充矩形（绝对像素坐标，相对背景图） */
 export interface TextRegion {
   x: number;
@@ -38,7 +47,13 @@ export interface TextRegion {
 export interface GenerateStampOptions {
   backgroundPath: string; // 基础背景图路径
   text: string;           // 动态输入的文字
-  fontSize?: number;      // 字体大小，默认 40
+  /**
+   * 字体大小（像素）。
+   * - 不指定 + 提供 `textRegion`：**自动跟随原图** = `textRegion.height - margin.top - margin.bottom`
+   * - 不指定 + 无 `textRegion`：默认 40
+   * - 指定数值：始终使用该值（覆盖自动跟随）
+   */
+  fontSize?: number;
   fontFamily?: string;    // 系统字体名称，默认 'Arial' 或 'sans-serif'
   fontURL?: string;       // 可选的在线字体文件 URL（如 Google Fonts），优先级最高
   fontFilePath?: string;  // 可选的本地字体文件路径（.ttf/.otf/.woff/.woff2 等），优先级仅次于 fontURL
@@ -69,6 +84,42 @@ export interface GenerateStampOptions {
    * 仅 `textRegion` 存在且 `stretchTextRegion=false` 时生效。
    */
   overflowStrategy?: OverflowStrategy;
+
+  //  —— 斑驳效果（橡皮章质感） ——
+
+  /** 斑点模式，默认 `'per-char'`（更自然）。传 `'none'` 关闭。 */
+  speckleMode?: SpeckleMode;
+
+  /**
+   * 目标斑点覆盖率：0-1 之间，表示**文字像素中被打掉/被覆盖的目标占比**，默认 `0.0075`（0.75%）
+   *
+   * 推荐范围 **0.5% - 1%**（自然轻微的橡皮章/水印磨损）。算法会根据 `speckleSize`
+   * 自动反推所需斑点数，因此调整 size 不会改变最终覆盖率。仅 `speckleMode !== 'none'` 时生效。
+   */
+  speckleDensity?: number;
+
+  /**
+   * 单个斑点的"基础半径"（像素），默认 `1.2`。
+   * 实际斑点是 4-7 顶点的随机不规则多边形（类似屏幕雪花/锯齿块），
+   * 顶点距离中心 0.3 - 1.3 × size，因此真实形状变化大但面积仍极小。
+   */
+  speckleSize?: number;
+
+  /**
+   * 斑点颜色，默认 `'transparent'`（镂空/打洞模式，让背景透出）。
+   *
+   * - `'transparent'` 或 `'none'`：使用 `globalCompositeOperation = 'destination-out'`
+   *    在文字上打透明小洞，模拟橡皮章颜料缺失的视觉效果。
+   * - 其它 CSS 颜色（如 `'#FFFFFF'` / `'#000000'`）：使用 `'source-over'` 直接覆盖颜色，
+   *    适合需要"白色雪花斑点"或"黑色墨点"等特殊效果时显式指定。
+   */
+  speckleColor?: string;
+
+  /**
+   * 固定随机种子（整数）。用于测试可重复性。
+   * 不指定则使用 `Math.random()`（每次输出略有差异）
+   */
+  speckleSeed?: number;
 }
 
 export interface FontCacheEntry {
@@ -486,10 +537,15 @@ export async function encodeCanvas(
  *       - `shrink` (默认): 二分缩小字号到适配
  *       - `clip`         : 保持字号，裁剪到 region 内
  *       - `overflow`     : 保持字号，允许溢出
+ *
+ * 文字风格：
+ *   - 字号默认：`textRegion` 存在时跟随 region 高度；否则 40
+ *   - 斑驳质感：默认 `speckleMode='per-char'` + `speckleColor='transparent'`，
+ *               在文字上随机打**透明不规则多边形小洞**（类似屏幕雪花/锯齿），
+ *               目标覆盖率默认 0.75%（推荐 0.5%-1% 区间）。传 `speckleMode='none'` 可关闭。
  */
 export async function generateDynamicStamp(options: GenerateStampOptions): Promise<Buffer> {
   const text = options.text;
-  const fontSize = options.fontSize || 40;
   const isBold = options.fontBold !== false ? 'bold ' : '';
 
   // 1. 字体加载与样式构造
@@ -500,6 +556,21 @@ export async function generateDynamicStamp(options: GenerateStampOptions): Promi
   const margin = options.margin || { top: 20, right: 20, bottom: 20, left: 20 };
   const stretchTextRegion = options.stretchTextRegion !== false; // 默认 true
   const overflowStrategy: OverflowStrategy = options.overflowStrategy || 'shrink';
+
+  // —— 字号自动跟随 textRegion：未指定 fontSize 时
+  // 若提供 textRegion → 用 region 高度去除上下边距，否则默认 40
+  let fontSize: number;
+  if (options.fontSize !== undefined) {
+    fontSize = options.fontSize;
+  } else if (options.textRegion) {
+    const inferred = options.textRegion.height - margin.top - margin.bottom;
+    fontSize = Math.max(8, Math.floor(inferred));
+  } else {
+    fontSize = 40;
+  }
+
+  // —— 斑驳参数 ——
+  const speckleConfig = resolveSpeckleConfig(options);
 
   // 2. 加载背景图
   const bgImage = await loadImage(options.backgroundPath);
@@ -531,6 +602,7 @@ export async function generateDynamicStamp(options: GenerateStampOptions): Promi
       fontColor,
       measureCtx,
       encodeOptions: options.encodeOptions,
+      speckleConfig,
     });
   }
 
@@ -558,6 +630,17 @@ export async function generateDynamicStamp(options: GenerateStampOptions): Promi
   ctx.textBaseline = 'middle';
   ctx.fillText(text, finalCanvasWidth / 2, finalCanvasHeight / 2);
 
+  // —— 斑驳效果（路径 A）：作用范围 = 文字外接矩形
+  if (speckleConfig.mode !== 'none') {
+    const textBoxX = Math.floor(finalCanvasWidth / 2 - textRealWidth / 2);
+    const textBoxY = Math.floor(finalCanvasHeight / 2 - textRealHeight / 2);
+    applySpeckle(
+      ctx,
+      textBoxX, textBoxY, textRealWidth, textRealHeight,
+      fontColor, speckleConfig,
+    );
+  }
+
   return await encodeCanvas(canvas, options.encodeOptions);
 }
 
@@ -579,6 +662,7 @@ interface RenderInRegionParams {
   fontColor: string;
   measureCtx: ReturnType<ReturnType<typeof createCanvas>['getContext']>;
   encodeOptions?: EncodeFormat | EncodeOptions;
+  speckleConfig: SpeckleConfig;
 }
 
 async function renderStampInRegion(p: RenderInRegionParams): Promise<Buffer> {
@@ -587,6 +671,7 @@ async function renderStampInRegion(p: RenderInRegionParams): Promise<Buffer> {
     text, textRegion, fontSize, textRealWidth, textRealHeight,
     margin, stretchTextRegion, overflowStrategy,
     buildFontStyle, fontColor, measureCtx, encodeOptions,
+    speckleConfig,
   } = p;
 
   // ── 校验 textRegion ──
@@ -705,9 +790,251 @@ async function renderStampInRegion(p: RenderInRegionParams): Promise<Buffer> {
     ctx.fillText(text, centerX, centerY);
   }
 
+  // —— 斑驳效果：作用范围 = textRegion 矩形（不超出，避免污染框外背景）
+  if (speckleConfig.mode !== 'none') {
+    applySpeckle(
+      ctx,
+      textRegion.x, textRegion.y, regionDrawWidth, textRegion.height,
+      fontColor, speckleConfig,
+    );
+  }
+
   // 抑制未读警告（textRealHeight 留作未来垂直拉伸用）
   void textRealHeight;
   void renderTextWidth;
 
   return await encodeCanvas(canvas, encodeOptions);
+}
+
+//  —— 斑驳效果（橡皮章质感）实现 ——
+
+interface SpeckleConfig {
+  mode: SpeckleMode;
+  density: number;     // 0-1：目标"被打掉/覆盖"的文字像素占比
+  size: number;        // 多边形基础半径 px
+  color: string;       // 斑点颜色（仅 transparent === false 时使用）
+  transparent: boolean; // true → destination-out 打透明洞；false → 直接填色
+  rng: () => number;   // 0-1 随机源
+}
+
+/** 简单 mulberry32 PRNG —— 32-bit seed → [0,1) */
+function createPRNG(seed: number | undefined): () => number {
+  if (seed === undefined) return Math.random;
+  let s = seed >>> 0;
+  return () => {
+    s = (s + 0x6D2B79F5) >>> 0;
+    let t = s;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** 判定颜色字符串是否为"透明"语义（用于触发 destination-out 打洞模式） */
+function isTransparentColor(c: string | undefined): boolean {
+  if (c === undefined) return true; // 未传 → 默认透明
+  const s = c.trim().toLowerCase();
+  if (s === 'transparent' || s === 'none') return true;
+  // rgba(...,0) / rgba(...,0.0)
+  const m = /^rgba?\(\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*(0(?:\.0+)?)\s*\)$/.exec(s);
+  if (m) return true;
+  // #RRGGBBAA 末两位 00
+  if (/^#[0-9a-f]{6}00$/.test(s)) return true;
+  // #RGBA 末一位 0
+  if (/^#[0-9a-f]{3}0$/.test(s)) return true;
+  return false;
+}
+
+/** 把宽松的 options 合并为严格的 SpeckleConfig，含参数校验 */
+function resolveSpeckleConfig(opts: GenerateStampOptions): SpeckleConfig {
+  const mode: SpeckleMode = opts.speckleMode ?? 'per-char';
+  if (mode !== 'none' && mode !== 'uniform' && mode !== 'per-char') {
+    throw new RangeError(`speckleMode 必须是 'none'|'uniform'|'per-char'，实际 "${mode}"`);
+  }
+  // 默认 0.75%：用户要求 0.5%-1% 文字面积覆盖（屏幕雪花/橡皮章自然磨损）
+  const density = opts.speckleDensity ?? 0.0075;
+  if (typeof density !== 'number' || !Number.isFinite(density) || density < 0 || density > 1) {
+    throw new RangeError(`speckleDensity 必须在 [0,1] 之间，实际 ${density}`);
+  }
+  const size = opts.speckleSize ?? 1.2;
+  if (typeof size !== 'number' || !Number.isFinite(size) || size <= 0 || size > 20) {
+    throw new RangeError(`speckleSize 必须在 (0,20] 之间，实际 ${size}`);
+  }
+  // 默认 'transparent' → destination-out 打洞
+  const colorRaw = opts.speckleColor ?? 'transparent';
+  const transparent = isTransparentColor(colorRaw);
+  return {
+    mode,
+    density,
+    size,
+    color: colorRaw,
+    transparent,
+    rng: createPRNG(opts.speckleSeed),
+  };
+}
+
+/**
+ * 把 #RRGGBB / #RGB / rgb(r,g,b) 解析为 RGB 元组
+ * 解析失败回退到默认粉色
+ */
+function parseColorToRGB(color: string): [number, number, number] {
+  if (typeof color !== 'string') return [255, 153, 168];
+  const s = color.trim().toLowerCase();
+  // #RGB
+  let m = /^#([0-9a-f])([0-9a-f])([0-9a-f])$/.exec(s);
+  if (m) {
+    return [parseInt(m[1]! + m[1]!, 16), parseInt(m[2]! + m[2]!, 16), parseInt(m[3]! + m[3]!, 16)];
+  }
+  // #RRGGBB
+  m = /^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/.exec(s);
+  if (m) {
+    return [parseInt(m[1]!, 16), parseInt(m[2]!, 16), parseInt(m[3]!, 16)];
+  }
+  // rgb(...)
+  m = /^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/.exec(s);
+  if (m) {
+    return [Number(m[1]), Number(m[2]), Number(m[3])];
+  }
+  return [255, 153, 168];
+}
+
+/**
+ * 在文字外接矩形内打**不规则透明小洞**（屏幕雪花/橡皮章磨损质感）
+ *
+ * 算法保证：被打掉/覆盖的文字像素比例 ≈ `cfg.density`（与斑点 size 解耦）
+ *
+ * 形状：每个斑点是 4-7 个顶点的随机不规则凸多边形（类似锯齿三角/五边/六边形），
+ *      顶点角度均匀分布并带 ±30% 抖动，半径在 `[0.3, 1.3] × size` 间，
+ *      模拟屏幕雪花/电视噪点/橡皮章颜料剥落的不规则形态。
+ *
+ * 颜色：
+ *   - `cfg.transparent === true`（默认）→ `globalCompositeOperation='destination-out'`
+ *     直接把文字像素打成透明（露出背景），不引入新颜色，最自然。
+ *   - `cfg.transparent === false` → 直接用 `cfg.color` 实色覆盖（兼容 white/black 模式）。
+ *
+ * 步骤：
+ *   1. 读取矩形内 imageData，扫描"文字像素"（接近 fontColor 的有色像素）
+ *   2. 估算单多边形的平均覆盖面积 ≈ π × size² × `ANTIALIAS_COMPENSATION`
+ *   3. 反推目标斑点数 N = max(1, round(candidates × density / 单斑面积))
+ *   4. 按模式抽样：
+ *      - uniform : 全部候选按 prob = N / candidates 均匀抽样
+ *      - per-char: 按 x 分桶（桶宽 ≈ 一个字符），每桶 prob 带 ±35% 抖动，
+ *                  全局总数仍 ≈ N
+ *   5. 在抽中坐标上构建多边形 path 并 fill（destination-out 或 source-over）
+ *
+ * 注意：传入的 (x,y,w,h) 必须在画布范围内，否则会被 clamp。
+ */
+function applySpeckle(
+  ctx: ReturnType<ReturnType<typeof createCanvas>['getContext']>,
+  x: number, y: number, w: number, h: number,
+  fontColor: string,
+  cfg: SpeckleConfig,
+): void {
+  if (cfg.mode === 'none' || cfg.density === 0) return;
+  // canvas 实际尺寸（用 ctx.canvas 获取）
+  const cvs = ctx.canvas;
+  const ix = Math.max(0, Math.floor(x));
+  const iy = Math.max(0, Math.floor(y));
+  const iw = Math.min(cvs.width - ix, Math.ceil(w));
+  const ih = Math.min(cvs.height - iy, Math.ceil(h));
+  if (iw <= 0 || ih <= 0) return;
+
+  const [fr, fg, fb] = parseColorToRGB(fontColor);
+  const tol = 80; // 颜色匹配容差（足够覆盖抗锯齿边缘）
+
+  const data = ctx.getImageData(ix, iy, iw, ih).data;
+  // 收集文字像素相对坐标
+  const candidates: number[] = []; // 平铺存储 [x0,y0,x1,y1,...]
+  for (let py = 0; py < ih; py++) {
+    for (let px = 0; px < iw; px++) {
+      const i = (py * iw + px) * 4;
+      const r = data[i]!, g = data[i + 1]!, b = data[i + 2]!, a = data[i + 3]!;
+      if (a < 64) continue; // 跳过透明像素
+      const dr = r - fr, dg = g - fg, db = b - fb;
+      if (dr * dr + dg * dg + db * db <= tol * tol) {
+        candidates.push(px, py);
+      }
+    }
+  }
+  const candidateCount = candidates.length / 2;
+  if (candidateCount === 0) return;
+
+  // —— 目标覆盖率反推斑点数 ——
+  const targetPunchedPixels = candidateCount * cfg.density;
+  // 单个不规则多边形的"有效像素打扰数" ≈ π × size² × 抗锯齿/destination-out 折算
+  // 经验值 0.12：实测下与白色圆斑(0.7)相比约 ~5.8×，原因：
+  //   1. 多边形面积 ≈ 圆面积 × 0.55（顶点 radius 0.3-1.3 抖动平均）
+  //   2. destination-out 边缘是连续 alpha 衰减，大量像素只被"部分擦除"（alpha 0.3-0.7），
+  //      测试的 pink 阈值需要 alpha 接近 0 才会"流失"，因此实际"完全打掉"像素少
+  //   3. 细笔画字母（Approved/Draft 等小写）候选像素多在 stroke 边缘，
+  //      多边形落点更易跨出有色区，单 dot 有效擦除率比粗体低
+  // 经 0.5%-1% 目标实测校准（默认 density=0.0075、size=1.2）：
+  //   各类字形（粗体/细体）覆盖率均落在 0.5%-1.0% 区间内，符合用户要求
+  const ANTIALIAS_COMPENSATION = 0.12;
+  // 注：floor 用 0.1 而非 1，否则 π × size² × compensation 在 size<2 时会被 clamp 失效，
+  // 让 compensation 调参无效。0.1 仍能挡住极端 size→0 的除零风险。
+  const pixelsPerDot = Math.max(0.1, Math.PI * cfg.size * cfg.size * ANTIALIAS_COMPENSATION);
+  const targetDots = Math.max(1, Math.round(targetPunchedPixels / pixelsPerDot));
+  // 抽样概率 = 目标数 / 候选数，clamp 到 [0,1]
+  const baseProb = Math.min(1, targetDots / candidateCount);
+
+  // 抽样
+  const picked: Array<[number, number]> = [];
+  if (cfg.mode === 'uniform') {
+    for (let k = 0; k < candidates.length; k += 2) {
+      if (cfg.rng() < baseProb) picked.push([candidates[k]!, candidates[k + 1]!]);
+    }
+  } else {
+    // per-char：按 x 分桶，桶宽 ≈ 一个字符（粗略用 sqrt(候选数) 做兜底，最小 16）
+    const bucketWidth = Math.max(16, Math.floor(Math.sqrt(candidateCount) * 1.5));
+    const bucketProb = new Map<number, number>(); // 桶 → 该桶实际抽样概率（带抖动）
+    for (let k = 0; k < candidates.length; k += 2) {
+      const px = candidates[k]!;
+      const bucket = Math.floor(px / bucketWidth);
+      let prob = bucketProb.get(bucket);
+      if (prob === undefined) {
+        // 抖动 ±35%（0.65× ~ 1.35×），clamp 到 [0,1]
+        // 不用 ±50% 是因为单字符在极端抖动 + 抽样方差下可能突破上界
+        prob = Math.min(1, baseProb * (0.65 + cfg.rng() * 0.7));
+        bucketProb.set(bucket, prob);
+      }
+      if (cfg.rng() < prob) picked.push([px, candidates[k + 1]!]);
+    }
+  }
+
+  // —— 绘制不规则多边形（屏幕雪花/锯齿斑驳） ——
+  ctx.save();
+  if (cfg.transparent) {
+    // destination-out 模式：把文字像素打成透明（露出底层背景）
+    // fillStyle 的颜色不影响结果，但必须 opaque（alpha=1）才能完全擦除
+    ctx.globalCompositeOperation = 'destination-out';
+    ctx.fillStyle = '#000';
+  } else {
+    // source-over 模式：用 cfg.color 实色覆盖（兼容白/黑斑点旧行为）
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.fillStyle = cfg.color;
+  }
+  for (const [px, py] of picked) {
+    // 多边形中心：像素中心 + 微抖动（±0.3px 避免严格对齐网格）
+    const cx = ix + px + 0.5 + (cfg.rng() - 0.5) * 0.6;
+    const cy = iy + py + 0.5 + (cfg.rng() - 0.5) * 0.6;
+    // 顶点数 4-7（避免 3 的过分尖锐）
+    const n = 4 + Math.floor(cfg.rng() * 4);
+    const angleStep = (Math.PI * 2) / n;
+    const baseAngle = cfg.rng() * Math.PI * 2; // 整体旋转随机
+    ctx.beginPath();
+    for (let i = 0; i < n; i++) {
+      // 角度：均匀分布 + ±30% 抖动（保持顶点环绕但不规则）
+      const angle = baseAngle + angleStep * i + (cfg.rng() - 0.5) * angleStep * 0.6;
+      // 半径：基础 size × [0.3, 1.3]（顶点远近大幅变化 → 屏幕雪花锯齿感）
+      const r = cfg.size * (0.3 + cfg.rng() * 1.0);
+      const vx = cx + Math.cos(angle) * r;
+      const vy = cy + Math.sin(angle) * r;
+      if (i === 0) ctx.moveTo(vx, vy);
+      else ctx.lineTo(vx, vy);
+    }
+    ctx.closePath();
+    ctx.fill();
+  }
+  ctx.restore();
 }

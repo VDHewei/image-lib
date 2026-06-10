@@ -21,6 +21,7 @@ const DEFAULT_TARGETS = [
   'tests/data',
   'src/font_cache',
   'font_cache',
+  'out'
 ];
 
 const ALL_TARGETS = [
