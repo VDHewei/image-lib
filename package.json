@@ -1,0 +1,69 @@
+﻿{
+  "name": "image_lib",
+  "version": "0.1.0",
+  "description": "基于 @napi-rs/canvas 的轻量图片处理库：动态文本印章生成 + 透明背景抠图，支持远程/本地/系统字体",
+  "type": "module",
+  "main": "./src/main.ts",
+  "module": "./src/main.ts",
+  "types": "./src/main.ts",
+  "bin": {
+    "image-lib": "./src/bin.ts"
+  },
+  "exports": {
+    ".": {
+      "types": "./src/main.ts",
+      "import": "./src/main.ts",
+      "default": "./src/main.ts"
+    },
+    "./bin": "./src/bin.ts"
+  },
+  "files": [
+    "src",
+    "assets",
+    "README.md",
+    "README.zh-CN.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "bun test",
+    "test:watch": "bun test --watch",
+    "test:image": "bun test tests/create_image.test.ts",
+    "test:stamp": "bun test tests/create_dynamic_stamp.test.ts",
+    "clean:test": "bun run scripts/clean-test.ts",
+    "clean:all": "bun run scripts/clean-test.ts --all",
+    "build": "bun build ./src/main.ts --outdir dist --target node --format esm --sourcemap=linked",
+    "build:logo": "bun run scripts/build-logo.ts",
+    "compile": "bun build ./src/bin.ts --compile --outfile dist/image-lib",
+    "compile:win": "bun build ./src/bin.ts --compile --target=bun-windows-x64 --outfile dist/image-lib.exe",
+    "compile:linux": "bun build ./src/bin.ts --compile --target=bun-linux-x64 --outfile dist/image-lib-linux",
+    "compile:mac": "bun build ./src/bin.ts --compile --target=bun-darwin-arm64 --outfile dist/image-lib-mac",
+    "prepublishOnly": "bun test && bun run build",
+    "publish:pnpm": "pnpm publish --access public",
+    "cli": "bun run src/bin.ts",
+    "demo:stamp": "bun run src/bin.ts stamp --bg images/draft.png --text \"草稿\" --out out/demo-stamp.png",
+    "demo:crop": "bun run src/bin.ts crop --src images/draft.png --out out/demo-crop.png"
+  },
+  "keywords": [
+    "image",
+    "canvas",
+    "stamp",
+    "watermark",
+    "crop",
+    "napi-rs",
+    "bun",
+    "typescript"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@napi-rs/canvas": "npm:@napi-rs/canvas"
+  },
+  "engines": {
+    "bun": ">=1.0.0"
+  }
+}
