@@ -36,12 +36,12 @@
 
 ```bash
 # With Bun (recommended)
-bun add image_lib
+bun add npm:@vdhewei/image-lib
 
 # With pnpm / npm / yarn
-pnpm add image_lib
-npm  install image_lib
-yarn add image_lib
+pnpm add @vdhewei/image-lib
+npm  install @vdhewei/image-lib
+yarn add @vdhewei/image-lib
 ```
 
 > Requires **Bun  1.0** or **Node  18** (with `@napi-rs/canvas` prebuilt binaries).

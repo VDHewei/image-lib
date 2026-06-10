@@ -1,5 +1,5 @@
 ﻿{
-  "name": "image_lib",
+  "name": "@vdhewei/image-lib",
   "version": "0.1.0",
   "description": "基于 @napi-rs/canvas 的轻量图片处理库：动态文本印章生成 + 透明背景抠图，支持远程/本地/系统字体",
   "type": "module",
