@@ -26,6 +26,7 @@
   ],
   "scripts": {
     "test": "bun test",
+    "audit:tofu": "bun run scripts/tofu-audit.ts",
     "test:watch": "bun test --watch",
     "test:image": "bun test tests/create_image.test.ts",
     "test:stamp": "bun test tests/create_dynamic_stamp.test.ts",

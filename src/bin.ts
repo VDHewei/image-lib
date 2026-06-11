@@ -123,7 +123,9 @@ OUTPUT:
 FONT:
   --font-url <url>            远程字体 URL（优先级最高）
   --font-file <path>          本地字体文件路径
-  --font-family <css>         系统字体族（默认跨平台后备）
+  --font-family <css>         指定字体族（**单一字体名**，如 "Microsoft YaHei"）
+                                ⚠️ Skia 不做 per-glyph 回退,逗号链(如 "Arial, YaHei")
+                                只取第一个。不指定时按文本含 CJK 与否自动挑平台字体
   --font-name <name>          注册到 GlobalFonts 的字体名
   --font-size <size>          字号；支持 32 / 32px / 24pt（pt→px：×96/72）
                                 不指定时跟随 textRegion.height-margin；否则默认 40px
@@ -232,10 +234,16 @@ CROP FLAGS (透传给 crop 步骤):
   --no-transparent            显式关闭颜色透明化
   --padding <px>              outside 内缩 / inside 外扩（默认 0）
 
-FONT (与 stamp 完全一致；gen 专属默认：family=sans-serif，size=24pt32px):
+FONT (与 stamp 完全一致；gen 专属默认：size=24pt=32px，family 智能挑选):
   --font-url <url>            远程字体 URL（优先级最高）
   --font-file <path>          本地字体文件路径
-  --font-family <css>         系统字体族（gen 默认 sans-serif）
+  --font-family <css>         指定字体族（**单一字体名**，如 "Microsoft YaHei"）
+                                ⚠️ Skia 不做 per-glyph 回退,所以传逗号链如
+                                "Arial, Microsoft YaHei" 只会用 Arial 第一个,
+                                中文字符会变成豆腐块 □。请只传一个家族名。
+                                不指定时按文本内容自动挑:
+                                  含中日韩 → 平台 CJK 字体(YaHei / PingFang SC / Noto CJK)
+                                  否则     → 平台 Latin 字体(Arial / Helvetica / DejaVu Sans)
   --font-name <name>          注册到 GlobalFonts 的字体名
   --font-size <size>          字号；支持 32 / 32px / 24pt（pt→px：×96/72）
                                 gen 默认 24pt = 32px；指定后覆盖 region 自动推断
@@ -545,20 +553,14 @@ async function runGen(p: ParsedArgs): Promise<void> {
   const cropResult = await cropTransparentBackground(cropOpts);
   const r = cropResult.region;
 
-  // ——  2. 印章（textRegion 直接复用 crop 返回的 region） ——
+  // —— 印章（textRegion 直接复用 crop 返回的 region） ——
   const stampOpts = buildStampOptions(p, intermediatePath, text, encodeOptions, r);
 
-  // —— gen 专属默认字体（仅在用户未显式指定时生效） ——
-  // - fontFamily 默认 'sans-serif'，但若用户用 --font-url / --font-file / --font-name
-  //   提供了其它字体源，则不覆盖（保留 loadFont 优先级语义）
-  // - fontSize 默认 24pt = 32px（96 DPI 下 24 × 4/3 = 32）
-  const hasFontSource = stampOpts.fontURL !== undefined
-    || stampOpts.fontFilePath !== undefined
-    || stampOpts.fontFamily !== undefined
-    || stampOpts.fontName !== undefined;
-  if (!hasFontSource) {
-    stampOpts.fontFamily = 'sans-serif';
-  }
+  // —— gen 专属默认（仅在用户未显式指定时生效） ——
+  // - fontFamily 不再硬塞 'sans-serif' —— Skia 不做 per-glyph 回退,'sans-serif'
+  //   会映射到 Latin 字体导致中文渲染豆腐块。改为 undefined,让 loadFont 根据
+  //   文本内容(含 CJK?)智能挑选已注册的单一字体名(平台 CJK 字体 / Latin 字体)
+  // - fontSize 默认 24pt = 32px(96 DPI 下 24 × 4/3 = 32)
   if (stampOpts.fontSize === undefined) {
     stampOpts.fontSize = Math.round(24 * 96 / 72); // 24pt → 32px
   }

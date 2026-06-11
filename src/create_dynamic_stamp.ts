@@ -373,6 +373,11 @@ export function resolveFontCachePath(options: FontCacheEntry): string {
  *    由 @napi-rs/canvas 在 Skia 层走系统字体回退（Linux 需安装 fontconfig）。
  *
  * 任意一步失败都会回退到下一步，最终兜底返回跨平台后备字体族，确保渲染不出豆腐块。
+ *
+ * **关于字体回退链的重要说明**：@napi-rs/canvas 的 Skia 后端**不会**做 per-glyph 回退。
+ * 即 `"Arial, Microsoft YaHei"` 不是"Arial 找不到的字符 fallback 到 YaHei",
+ * 而是"用 Arial,找不到字符就渲染豆腐块 □"。所以末段 fallback **必须根据文本内容**
+ * 返回**单一**合适字体（含 CJK 字符 → 平台 CJK 字体；否则 → 平台 Latin 字体）。
  */
 export async function loadFont(options: GenerateStampOptions): Promise<string> {
   // —— ① 远程字体优先 ——
@@ -405,8 +410,128 @@ export async function loadFont(options: GenerateStampOptions): Promise<string> {
     }
   }
 
-  // —— ③ 系统字体族（CSS font-family 字符串） ——
-  return options.fontFamily || 'Arial, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif';
+  // —— ③ 系统字体族 / 智能兜底 ——
+  // 用户显式指定 → 尊重之。但 Skia 的链回退是 per-glyph 的(实测有效):
+  // 若文本含 CJK 而链中无 CJK 字体,自动 append 平台 CJK 字体兜底,
+  // Latin 字符仍用用户字体,汉字走回退 —— 与浏览器行为一致,杜绝豆腐块。
+  if (options.fontFamily) {
+    if (hasCJK(options.text) && !familyChainHasCJK(options.fontFamily)) {
+      const cjk = pickSmartFallbackFamily(options.text);
+      console.warn(
+        `[loadFont] 文本含中日韩字符但 fontFamily "${options.fontFamily}" 无 CJK 字体,` +
+        `已自动追加 "${cjk}" 兜底`,
+      );
+      return `${options.fontFamily}, "${cjk}"`;
+    }
+    return options.fontFamily;
+  }
+  // 未指定 → 按文本内容智能选,返回 GlobalFonts 里**实际存在**的单一字体名
+  return pickSmartFallbackFamily(options.text);
+}
+
+/** Unicode 范围正则:常见 CJK 块(中日韩统一表意 / 假名 / 谚文 / CJK 兼容标点等) */
+const CJK_PATTERN = /[\u2e80-\u2eff\u2f00-\u2fdf\u3000-\u303f\u3040-\u30ff\u3100-\u312f\u3130-\u318f\u31a0-\u31bf\u31c0-\u31ef\u31f0-\u31ff\u3200-\u32ff\u3300-\u33ff\u3400-\u4dbf\u4e00-\u9fff\ua000-\ua4cf\uac00-\ud7af\uf900-\ufaff\ufe30-\ufe4f\uff00-\uffef]/;
+
+/** 文本是否包含 CJK 字符(用于决定 fallback 字体选 CJK 还是 Latin) */
+function hasCJK(text: string): boolean {
+  return CJK_PATTERN.test(text);
+}
+
+/**
+ * 已知 CJK 字体名关键词(不区分大小写)。
+ * 覆盖 Windows / macOS / Linux 常见中日韩字体的命名习惯。
+ * 用于判断用户给的 font-family 链中是否已含 CJK 字体。
+ */
+const CJK_FONT_KEYWORD = new RegExp(
+  [
+    'yahei', 'jhenghei', 'simsun', 'simhei', 'nsimsun', 'fangsong', 'kaiti', 'dengxian', 'mingliu',
+    'pingfang', 'hiragino', 'heiti', 'songti', 'stsong', 'stheiti', 'stkaiti', 'stfangsong',
+    'noto\\s*(sans|serif)\\s*(cjk|sc|tc|hk|jp|kr)', 'source\\s*han', 'sarasa',
+    'wenquanyi', 'wqy', 'droid\\s*sans\\s*fallback',
+    'ms\\s*(gothic|mincho|pgothic|pmincho)', 'yu\\s*(gothic|mincho)', 'meiryo',
+    'malgun', 'batang', 'gulim', 'dotum', 'apple\\s*sd\\s*gothic',
+    '黑体', '宋体', '楷体', '仿宋', '微软雅黑', '苹方', '思源',
+  ].join('|'),
+  'i',
+);
+
+/**
+ * 判断 CSS font-family 链中是否已包含 CJK 字体。
+ * 链按逗号拆分,去引号/空白后:
+ *  1. 名字匹配已知 CJK 关键词 → true
+ *  2. 名字在 GlobalFonts 注册且属于 CJK_FALLBACK_CANDIDATES → true
+ */
+function familyChainHasCJK(familyChain: string): boolean {
+  const families = familyChain
+    .split(',')
+    .map(s => s.trim().replace(/^['"]|['"]$/g, ''))
+    .filter(Boolean);
+  const platformCJK = new Set(
+    Object.values(CJK_FALLBACK_CANDIDATES).flat().map(s => s.toLowerCase()),
+  );
+  return families.some(f => CJK_FONT_KEYWORD.test(f) || platformCJK.has(f.toLowerCase()));
+}
+
+/** 各平台优先尝试的 CJK 字体列表(顺序 = 偏好) */
+const CJK_FALLBACK_CANDIDATES: Record<string, readonly string[]> = {
+  win32: [
+    'Microsoft YaHei',     // Windows 简中默认
+    'Microsoft JhengHei',  // Windows 繁中
+    'SimHei', 'SimSun',    // 老牌中文字体
+    'Malgun Gothic',       // Windows 韩文
+    'Yu Gothic', 'MS Gothic', // Windows 日文
+    'Source Han Sans CN',  // 思源黑体(若装了)
+    'Noto Sans CJK SC', 'Noto Sans SC',
+  ],
+  darwin: [
+    'PingFang SC',         // macOS 简中默认 (10.11+)
+    'PingFang TC', 'PingFang HK',
+    'Heiti SC', 'STHeiti', // macOS 老版中文
+    'Hiragino Sans GB',    // macOS 简中(辅助)
+    'Hiragino Sans',       // macOS 日文
+    'Apple SD Gothic Neo', // macOS 韩文
+    'Source Han Sans CN', 'Noto Sans CJK SC',
+  ],
+  linux: [
+    'Noto Sans CJK SC',    // Linux 标准 CJK
+    'Noto Sans SC',
+    'Source Han Sans CN',
+    'WenQuanYi Micro Hei', 'WenQuanYi Zen Hei',
+    'Droid Sans Fallback',
+    'DejaVu Sans',         // 至少能渲染部分 CJK
+  ],
+};
+
+/** 各平台优先尝试的 Latin 字体列表 */
+const LATIN_FALLBACK_CANDIDATES: Record<string, readonly string[]> = {
+  win32:  ['Arial', 'Segoe UI', 'Tahoma', 'Verdana'],
+  darwin: ['Helvetica Neue', 'Helvetica', 'Arial', 'San Francisco'],
+  linux:  ['DejaVu Sans', 'Liberation Sans', 'Noto Sans', 'Arial'],
+};
+
+/**
+ * 智能挑选已注册的兜底字体名(返回**单一**家族名,因为 Skia 不做 per-glyph fallback)。
+ * - 文本含 CJK → 优先选平台 CJK 字体
+ * - 否则       → 优先选平台 Latin 字体
+ * - 候选都不在 GlobalFonts → 抓 GlobalFonts.families 的第一个作最终兜底
+ * - 极端情况:GlobalFonts 为空 → 返回 'sans-serif' (让 Skia 走自己的默认)
+ */
+function pickSmartFallbackFamily(text: string): string {
+  const plat = process.platform;
+  const list = (hasCJK(text) ? CJK_FALLBACK_CANDIDATES : LATIN_FALLBACK_CANDIDATES);
+  const candidates = list[plat] ?? list.linux!;
+  for (const name of candidates) {
+    if (GlobalFonts.has(name)) return name;
+  }
+  // 候选全 miss:翻一下系统装的字体,挑第一个能用的
+  try {
+    const families = GlobalFonts.families as ReadonlyArray<{ family: string } | string>;
+    if (Array.isArray(families) && families.length > 0) {
+      const first = families[0]!;
+      return typeof first === 'string' ? first : first.family;
+    }
+  } catch { /* 忽略 */ }
+  return 'sans-serif';
 }
 
 /**
